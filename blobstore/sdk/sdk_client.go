@@ -29,6 +29,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/resourcepool"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
+	"github.com/cubefs/cubefs/blobstore/common/rpc/auditlog"
 	"github.com/cubefs/cubefs/blobstore/common/security"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/util/closer"
@@ -49,6 +50,8 @@ const (
 	limitNameGet    = "get"
 	limitNamePut    = "put"
 	limitNameDelete = "delete"
+
+	moduleName = "sdk"
 )
 
 type noopBody struct{}
@@ -60,6 +63,7 @@ func (rc noopBody) Close() error                     { return nil }
 
 type Config struct {
 	stream.StreamConfig `json:"stream"`
+	AuditLog            auditlog.Config `json:"auditlog"`
 
 	Limit           stream.LimitConfig `json:"limit"`
 	MaxSizePutOnce  int64              `json:"max_size_put_once"`
@@ -77,6 +81,9 @@ type sdkHandler struct {
 	limiter stream.Limiter
 	closer  closer.Closer
 	memPool *resourcepool.MemPool
+
+	alHandler auditlog.OpHandler
+	alCloser  auditlog.LogCloser
 }
 
 func New(conf *Config) (acapi.Client, error) {
@@ -85,6 +92,23 @@ func New(conf *Config) (acapi.Client, error) {
 	security.InitWithRegionMagic(conf.StreamConfig.ClusterConfig.RegionMagic)
 
 	cl := closer.New()
+
+	var err error
+	var oh auditlog.OpHandler
+	var lc auditlog.LogCloser
+
+	if conf.AuditLog.LogDir != "" {
+		oh, lc, err = auditlog.Open(moduleName, &conf.AuditLog)
+		if err != nil {
+			log.Errorf("failed to initialize audit log: %v", err)
+			if lc != nil {
+				lc.Close()
+			}
+
+			return nil, err
+		}
+	}
+
 	h, err := stream.NewStreamHandler(&conf.StreamConfig, cl.Done())
 	if err != nil {
 		log.Errorf("new stream handler failed, err: %+v", err)
@@ -107,10 +131,43 @@ func New(conf *Config) (acapi.Client, error) {
 		memPool: admin.MemPool,
 		limiter: stream.NewLimiter(conf.Limit),
 		closer:  cl,
+
+		alHandler: oh,
+		alCloser:  lc,
 	}, nil
 }
 
-func (s *sdkHandler) Get(ctx context.Context, args *acapi.GetArgs) (io.ReadCloser, error) {
+func (s *sdkHandler) Close() error {
+	if s != nil {
+		s.closer.Close()
+		if s.alCloser != nil {
+			s.alCloser.Close()
+		}
+	}
+
+	return nil
+}
+
+func (s *sdkHandler) StartAudit(ctx context.Context, method, reqParams string) (*auditlog.AuditLogEntry, context.Context) {
+	if s.alHandler != nil {
+		return s.alHandler.StartAudit(ctx, moduleName, method, reqParams)
+	} else {
+		return nil, ctx
+	}
+}
+
+func (s *sdkHandler) FinishAudit(e *auditlog.AuditLogEntry, statusCode int) {
+	if e != nil {
+		e.FinishAudit(statusCode)
+	}
+}
+
+func (s *sdkHandler) Get(ctx context.Context, args *acapi.GetArgs) (rc io.ReadCloser, err error) {
+	e, ctx := s.StartAudit(ctx, "Get", args.JSONString())
+	defer func() {
+		s.FinishAudit(e, errcode.DetectCode(err))
+	}()
+
 	if !args.IsValid() {
 		return nil, errcode.ErrIllegalArguments
 	}
@@ -139,6 +196,11 @@ func (s *sdkHandler) Get(ctx context.Context, args *acapi.GetArgs) (io.ReadClose
 }
 
 func (s *sdkHandler) Delete(ctx context.Context, args *acapi.DeleteArgs) (failedLocations []proto.Location, err error) {
+	e, ctx := s.StartAudit(ctx, "Delete", args.JSONString())
+	defer func() {
+		s.FinishAudit(e, errcode.DetectCode(err))
+	}()
+
 	if !args.IsValid() {
 		return nil, errcode.ErrIllegalArguments
 	}
@@ -180,6 +242,11 @@ func (s *sdkHandler) Delete(ctx context.Context, args *acapi.DeleteArgs) (failed
 }
 
 func (s *sdkHandler) Put(ctx context.Context, args *acapi.PutArgs) (lc proto.Location, hm acapi.HashSumMap, err error) {
+	e, ctx := s.StartAudit(ctx, "Put", args.JSONString())
+	defer func() {
+		s.FinishAudit(e, errcode.DetectCode(err))
+	}()
+
 	if args == nil {
 		return proto.Location{}, nil, errcode.ErrIllegalArguments
 	}

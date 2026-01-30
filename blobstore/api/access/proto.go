@@ -19,6 +19,8 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"hash"
 	"hash/crc32"
 	"io"
@@ -216,6 +218,14 @@ type PutArgs struct {
 	GetBody func() (io.ReadCloser, error) `json:"-"`
 }
 
+func (args *PutArgs) JSONString() string {
+	data, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Sprintf(`{"error":"failed to marshal PutArgs: %v"}`, err)
+	}
+	return string(data)
+}
+
 // IsValid is valid put args
 func (args *PutArgs) IsValid() bool {
 	if args == nil {
@@ -293,6 +303,14 @@ type GetArgs struct {
 	Writer   io.Writer      `json:"-"`
 }
 
+func (args *GetArgs) JSONString() string {
+	data, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Sprintf(`{"error":"failed to marshal GetArgs: %v"}`, err)
+	}
+	return string(data)
+}
+
 // IsValid is valid get args
 func (args *GetArgs) IsValid() bool {
 	if args == nil {
@@ -306,6 +324,14 @@ func (args *GetArgs) IsValid() bool {
 // DeleteArgs for service /delete
 type DeleteArgs struct {
 	Locations []proto.Location `json:"locations"`
+}
+
+func (args *DeleteArgs) JSONString() string {
+	data, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Sprintf(`{"error":"failed to marshal DeleteArgs: %v"}`, err)
+	}
+	return string(data)
 }
 
 // IsValid is valid delete args

@@ -16,6 +16,7 @@ package auditlog
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -113,10 +114,97 @@ func (a *AuditLog) ToJson() (b []byte) {
 	return
 }
 
-func Open(module string, cfg *Config) (ph interface {
+// AuditLogEntry represents a single audit log record under construction.
+// It is NOT thread-safe and must be used only within the creating goroutine.
+type AuditLogEntry struct {
+	span       trace.Span
+	module     string
+	method     string
+	reqParams  string
+	startTime  time.Time
+	statusCode int
+	finished   bool
+	j          *jsonAuditlog
+}
+
+// FinishAudit finalizes and writes the audit log entry.
+func (e *AuditLogEntry) FinishAudit(statusCode int) {
+	if e.finished || e.j == nil {
+		return
+	}
+	e.finished = true
+	e.statusCode = statusCode
+
+	span := e.span
+	var fakeRespHeader M = make(M)
+	if e.span != nil {
+		defer span.Finish()
+
+		traceLogs := span.TrackLog()
+		if len(traceLogs) > 0 {
+			fakeRespHeader[rpc.HeaderTraceLog] = traceLogs
+		}
+
+		tags := span.Tags().ToSlice()
+		if len(tags) > 0 {
+			fakeRespHeader[rpc.HeaderTraceTags] = tags
+		}
+
+		if tid := span.TraceID(); tid != "" {
+			fakeRespHeader["Trace-ID"] = []string{tid}
+		}
+	}
+
+	auditLog := &AuditLog{
+		ReqType:    "REQ",
+		Module:     e.module,
+		StartTime:  e.startTime.UnixMicro(),
+		Method:     e.method,
+		ReqParams:  e.reqParams,
+		StatusCode: e.statusCode,
+		// Workaround: M{} may cause Encode() to return empty bytes,
+		// which leads to "unexpected end of JSON input" when parsed by request_row.
+		// Using a dummy key to ensure non-empty map.
+		ReqHeader:  M{"AuditLog-Empty": nil},
+		RespHeader: fakeRespHeader,
+		Duration:   time.Since(e.startTime).Microseconds(),
+	}
+
+	b := e.j.logPool.Get().(*bytes.Buffer)
+	defer e.j.logPool.Put(b)
+	b.Reset()
+
+	if e.j.logFile == nil || e.j.logFilter.Filter(auditLog) {
+		if !e.j.cfg.MetricsFilter {
+			e.j.metricSender.Send(auditLog.ToBytesWithTab(b))
+		}
+		return
+	}
+
+	e.j.metricSender.Send(auditLog.ToBytesWithTab(b))
+
+	var logBytes []byte
+	switch e.j.cfg.LogFormat {
+	case LogFormatJSON:
+		logBytes = auditLog.ToJson()
+	default:
+		logBytes = b.Bytes()
+	}
+
+	if err := e.j.logFile.Log(logBytes); err != nil {
+		if span != nil {
+			span.Errorf("AuditLogEntry.Finish Log failed: %v", err)
+		}
+	}
+}
+
+type OpHandler interface {
 	rpc2.Interceptor
 	rpc.ProgressHandler
-}, logFile LogCloser, err error,
+	StartAudit(ctx context.Context, module, method, reqParams string) (*AuditLogEntry, context.Context)
+}
+
+func Open(module string, cfg *Config) (ph OpHandler, logFile LogCloser, err error,
 ) {
 	if cfg.BodyLimit < 0 {
 		cfg.BodyLimit = 0
@@ -390,6 +478,22 @@ func (j *jsonAuditlog) Handle(w rpc2.ResponseWriter, req *rpc2.Request, f rpc2.H
 		span.Errorf("jsonlog.Handle logging failed, err: %s", errLog.Error())
 	}
 	return err
+}
+
+func (j *jsonAuditlog) StartAudit(ctx context.Context, module, method, reqParams string) (*AuditLogEntry, context.Context) {
+	span := trace.SpanFromContext(ctx)
+	if span == nil {
+		span, ctx = trace.StartSpanFromContext(ctx, method)
+	}
+
+	return &AuditLogEntry{
+		span:      span,
+		module:    module,
+		method:    method,
+		reqParams: reqParams,
+		startTime: time.Now(),
+		j:         j,
+	}, ctx
 }
 
 // ExtraHeader provides extra response header writes to the ResponseWriter.

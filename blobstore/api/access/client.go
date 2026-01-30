@@ -214,6 +214,7 @@ type API interface {
 	// - (nil, ErrIllegalArguments): when args is invalid.
 	// - (failedLocations, err): returns the list of locations that have not yet been deleted.
 	Delete(ctx context.Context, args *DeleteArgs) (failedLocations []proto.Location, err error)
+	io.Closer
 }
 
 type Client interface {
@@ -404,6 +405,8 @@ func getClient(cfg *Config, hosts []string) rpc.Client {
 
 	return rpc.NewLbClient(lbConfig, nil)
 }
+
+func (c *client) Close() error { return nil }
 
 func (c *client) Put(ctx context.Context, args *PutArgs) (location proto.Location, hashSumMap HashSumMap, err error) {
 	if args.Size == 0 {
