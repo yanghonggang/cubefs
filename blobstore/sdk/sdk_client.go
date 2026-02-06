@@ -17,6 +17,7 @@ package sdk
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/resourcepool"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
+	"github.com/cubefs/cubefs/blobstore/common/rpc/auditlog"
 	"github.com/cubefs/cubefs/blobstore/common/security"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/util/closer"
@@ -49,6 +51,8 @@ const (
 	limitNameGet    = "get"
 	limitNamePut    = "put"
 	limitNameDelete = "delete"
+
+	moduleName = "sdk"
 )
 
 type noopBody struct{}
@@ -60,6 +64,7 @@ func (rc noopBody) Close() error                     { return nil }
 
 type Config struct {
 	stream.StreamConfig `json:"stream"`
+	AuditLog            auditlog.Config `json:"auditlog"`
 
 	Limit           stream.LimitConfig `json:"limit"`
 	MaxSizePutOnce  int64              `json:"max_size_put_once"`
@@ -77,14 +82,39 @@ type sdkHandler struct {
 	limiter stream.Limiter
 	closer  closer.Closer
 	memPool *resourcepool.MemPool
+
+	alHandler auditlog.AuditHandler
+	alCloser  auditlog.LogCloser
 }
 
-func New(conf *Config) (acapi.Client, error) {
+type SDK interface {
+	acapi.Client
+	Close()
+}
+
+func New(conf *Config) (SDK, error) {
 	fixConfig(conf)
 	// add region magic checksum to the secret keys
 	security.InitWithRegionMagic(conf.StreamConfig.ClusterConfig.RegionMagic)
 
 	cl := closer.New()
+
+	var err error
+	oh := auditlog.NoopAuditHandler
+	lc := auditlog.NoopLogCloser
+
+	if conf.AuditLog.LogDir != "" {
+		oh, lc, err = auditlog.Open(moduleName, &conf.AuditLog)
+		if err != nil {
+			log.Errorf("failed to initialize audit log: %v", err)
+			if lc != nil {
+				lc.Close()
+			}
+
+			return nil, err
+		}
+	}
+
 	h, err := stream.NewStreamHandler(&conf.StreamConfig, cl.Done())
 	if err != nil {
 		log.Errorf("new stream handler failed, err: %+v", err)
@@ -107,122 +137,176 @@ func New(conf *Config) (acapi.Client, error) {
 		memPool: admin.MemPool,
 		limiter: stream.NewLimiter(conf.Limit),
 		closer:  cl,
+
+		alHandler: oh,
+		alCloser:  lc,
 	}, nil
 }
 
+func (s *sdkHandler) Close() {
+	s.closer.Close()
+	s.alCloser.Close()
+}
+
+func requestParams(args any) string {
+	data, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Sprintf(`{"error":"failed to marshal args: %v"}`, err)
+	}
+	return string(data)
+}
+
 func (s *sdkHandler) Get(ctx context.Context, args *acapi.GetArgs) (io.ReadCloser, error) {
-	if !args.IsValid() {
-		return nil, errcode.ErrIllegalArguments
-	}
+	var rc io.ReadCloser
+	err := s.alHandler.Audit(ctx, func(ctx context.Context, log *auditlog.AuditLog) error {
+		log.Method = "Get"
+		log.ReqParams = requestParams(args)
 
-	ctx = acapi.ClientWithReqidContext(ctx)
-	span := trace.SpanFromContextSafe(ctx)
-	span.Debugf("accept sdk get request args:%+v", args)
+		if !args.IsValid() {
+			return errcode.ErrIllegalArguments
+		}
 
-	if args.Location.Size_ == 0 || args.ReadSize == 0 {
-		return noopBody{}, nil
-	}
+		ctx = acapi.ClientWithReqidContext(ctx)
+		span := trace.SpanFromContextSafe(ctx)
+		span.Debugf("accept sdk get request args:%+v", args)
 
-	if !security.LocationCrcVerify(&args.Location) {
-		span.Errorf("sdk get, invalid crc, err:%+v ", errcode.ErrIllegalArguments)
-		return noopBody{}, errcode.ErrIllegalArguments
-	}
+		if args.Location.Size_ == 0 || args.ReadSize == 0 {
+			rc = noopBody{}
+			return nil
+		}
 
-	name := limitNameGet
-	if err := s.limiter.Acquire(name); err != nil {
-		span.Debugf("access concurrent limited %s, err:%+v", name, err)
-		return nil, errcode.ErrAccessLimited
-	}
-	defer s.limiter.Release(name)
+		if !security.LocationCrcVerify(&args.Location) {
+			rc = noopBody{}
+			span.Errorf("sdk get, invalid crc, err:%+v ", errcode.ErrIllegalArguments)
+			return errcode.ErrIllegalArguments
+		}
 
-	return s.doGet(ctx, args)
+		name := limitNameGet
+		if err := s.limiter.Acquire(name); err != nil {
+			span.Debugf("access concurrent limited %s, err:%+v", name, err)
+			return errcode.ErrAccessLimited
+		}
+		defer s.limiter.Release(name)
+
+		var innerErr error
+		rc, innerErr = s.doGet(ctx, args)
+		return innerErr
+	})
+	return rc, err
 }
 
 func (s *sdkHandler) Delete(ctx context.Context, args *acapi.DeleteArgs) (failedLocations []proto.Location, err error) {
-	if !args.IsValid() {
-		return nil, errcode.ErrIllegalArguments
-	}
+	var result []proto.Location
+	err = s.alHandler.Audit(ctx, func(ctx context.Context, log *auditlog.AuditLog) error {
+		log.Method = "Delete"
+		log.ReqParams = requestParams(args)
 
-	ctx = acapi.ClientWithReqidContext(ctx)
-	locations := make([]proto.Location, 0, len(args.Locations)) // check location size
-	for _, loc := range args.Locations {
-		if loc.Size_ > 0 {
-			locations = append(locations, loc)
+		if !args.IsValid() {
+			return errcode.ErrIllegalArguments
 		}
-	}
-	if len(locations) == 0 {
-		return nil, nil
-	}
 
-	name := limitNameDelete
-	if err := s.limiter.Acquire(name); err != nil {
-		span := trace.SpanFromContextSafe(ctx)
-		span.Debugf("access concurrent limited %s, err:%+v", name, err)
-		return locations, errcode.ErrAccessLimited
-	}
-	defer s.limiter.Release(name)
-
-	if err = retry.Timed(s.conf.MaxRetry, s.conf.RetryDelayMs).On(func() error {
-		// access response 2xx even if there has failed locations
-		deleteResp, err1 := s.doDelete(ctx, &acapi.DeleteArgs{Locations: locations})
-		if err1 != nil && rpc.DetectStatusCode(err1) != http.StatusIMUsed {
-			return err1
+		ctx = acapi.ClientWithReqidContext(ctx)
+		locations := make([]proto.Location, 0, len(args.Locations)) // check location size
+		for _, loc := range args.Locations {
+			if loc.Size_ > 0 {
+				locations = append(locations, loc)
+			}
 		}
-		if len(deleteResp.FailedLocations) > 0 {
-			locations = deleteResp.FailedLocations[:]
-			return errcode.ErrUnexpected
+		if len(locations) == 0 {
+			return nil
+		}
+
+		name := limitNameDelete
+		if err := s.limiter.Acquire(name); err != nil {
+			span := trace.SpanFromContextSafe(ctx)
+			span.Debugf("access concurrent limited %s, err:%+v", name, err)
+			result = locations
+			return errcode.ErrAccessLimited
+		}
+		defer s.limiter.Release(name)
+
+		if err = retry.Timed(s.conf.MaxRetry, s.conf.RetryDelayMs).On(func() error {
+			// access response 2xx even if there has failed locations
+			deleteResp, err1 := s.doDelete(ctx, &acapi.DeleteArgs{Locations: locations})
+			if err1 != nil && rpc.DetectStatusCode(err1) != http.StatusIMUsed {
+				return err1
+			}
+			if len(deleteResp.FailedLocations) > 0 {
+				locations = deleteResp.FailedLocations[:]
+				return errcode.ErrUnexpected
+			}
+			return nil
+		}); err != nil {
+			result = locations
+			return err
 		}
 		return nil
-	}); err != nil {
-		return locations, err
-	}
-	return nil, nil
+	})
+
+	return result, err
 }
 
 func (s *sdkHandler) Put(ctx context.Context, args *acapi.PutArgs) (lc proto.Location, hm acapi.HashSumMap, err error) {
-	if args == nil {
-		return proto.Location{}, nil, errcode.ErrIllegalArguments
-	}
+	var resultLoc proto.Location
+	var resultHM acapi.HashSumMap
 
-	if args.Size == 0 {
-		hashSumMap := args.Hashes.ToHashSumMap()
-		for alg := range hashSumMap {
-			hashSumMap[alg] = alg.ToHasher().Sum(nil)
-		}
-		return proto.Location{Slices: make([]proto.Slice, 0)}, hashSumMap, nil
-	}
+	err = s.alHandler.Audit(ctx, func(ctx context.Context, log *auditlog.AuditLog) error {
+		log.Method = "Put"
+		log.ReqParams = requestParams(args)
 
-	ctx = acapi.ClientWithReqidContext(ctx)
-
-	name := limitNamePut
-	if err := s.limiter.Acquire(name); err != nil {
-		span := trace.SpanFromContextSafe(ctx)
-		span.Debugf("access concurrent limited %s, err:%+v", name, err)
-		return proto.Location{}, nil, errcode.ErrAccessLimited
-	}
-	defer s.limiter.Release(name)
-
-	if args.Size <= s.conf.MaxSizePutOnce {
-		if args.GetBody == nil {
-			return s.doPutObject(ctx, args)
+		if args == nil {
+			return errcode.ErrIllegalArguments
 		}
 
-		i := 0
-		err = retry.Timed(s.conf.MaxRetry, s.conf.RetryDelayMs).On(func() error {
-			if i >= 1 {
-				args.Body, err = args.GetBody()
-				if err != nil {
-					return err
-				}
+		if args.Size == 0 {
+			hashSumMap := args.Hashes.ToHashSumMap()
+			for alg := range hashSumMap {
+				hashSumMap[alg] = alg.ToHasher().Sum(nil)
+			}
+			resultLoc = proto.Location{Slices: make([]proto.Slice, 0)}
+			resultHM = hashSumMap
+			return nil
+		}
+
+		ctx = acapi.ClientWithReqidContext(ctx)
+
+		name := limitNamePut
+		if err := s.limiter.Acquire(name); err != nil {
+			span := trace.SpanFromContextSafe(ctx)
+			span.Debugf("access concurrent limited %s, err:%+v", name, err)
+			return errcode.ErrAccessLimited
+		}
+		defer s.limiter.Release(name)
+
+		if args.Size <= s.conf.MaxSizePutOnce {
+			if args.GetBody == nil {
+				loc, hashMap, err := s.doPutObject(ctx, args)
+				resultLoc, resultHM = loc, hashMap
+				return err
 			}
 
-			i++
-			lc, hm, err = s.doPutObject(ctx, args)
-			return err
-		})
-		return lc, hm, err
-	}
-	return s.putParts(ctx, args)
+			i := 0
+			putErr := retry.Timed(s.conf.MaxRetry, s.conf.RetryDelayMs).On(func() error {
+				var innerErr error
+				if i >= 1 {
+					args.Body, innerErr = args.GetBody()
+					if innerErr != nil {
+						return innerErr
+					}
+				}
+				i++
+				resultLoc, resultHM, innerErr = s.doPutObject(ctx, args)
+				return innerErr
+			})
+			return putErr
+		}
+
+		loc, hashMap, err := s.putParts(ctx, args)
+		resultLoc, resultHM = loc, hashMap
+		return err
+	})
+
+	return resultLoc, resultHM, err
 }
 
 func (s *sdkHandler) ListBlob(ctx context.Context, args *acapi.ListBlobArgs) (shardnode.ListBlobRet, error) {
