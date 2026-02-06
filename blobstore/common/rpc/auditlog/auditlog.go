@@ -16,6 +16,7 @@ package auditlog
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -114,11 +115,100 @@ func (a *AuditLog) ToJson() (b []byte) {
 	return
 }
 
-func Open(module string, cfg *Config) (ph interface {
+// AuditLogEntry represents a single audit log record under construction.
+// It is NOT thread-safe and must be used only within the creating goroutine.
+type AuditLogEntry struct {
+	span       trace.Span
+	module     string
+	method     string
+	reqParams  string
+	startTime  time.Time
+	statusCode int
+	finished   bool
+	j          *jsonAuditlog
+}
+
+// FinishAudit finalizes and writes the audit log entry.
+func (e *AuditLogEntry) FinishAudit(statusCode int) {
+	if e == nil || e.finished || e.j == nil {
+		return
+	}
+	e.finished = true
+	e.statusCode = statusCode
+
+	span := e.span
+	var fakeRespHeader M = make(M)
+	if e.span != nil {
+		defer span.Finish()
+
+		trackN := span.TrackLogN()
+		if trackN > 0 {
+			traceLogs := make([]string, 0, trackN)
+			span.TrackLogRange(func(b *bytes.Buffer) bool {
+				traceLogs = append(traceLogs, b.String())
+				return true
+			})
+			fakeRespHeader[rpc.HeaderTraceLog] = traceLogs
+		}
+
+		tagsN := span.TagsN()
+		if tagsN > 0 {
+			tags := make([]string, 0, tagsN)
+			span.TagsRange(func(key string, val any) bool {
+				tags = append(tags, key+":"+fmt.Sprint(val))
+				return true
+			})
+			fakeRespHeader[rpc.HeaderTraceTags] = tags
+		}
+
+		if tid := span.TraceID(); tid != "" {
+			fakeRespHeader["Trace-ID"] = []string{tid}
+		}
+	}
+
+	auditLog := &AuditLog{
+		ReqType:    "REQ",
+		Module:     e.module,
+		StartTime:  e.startTime.UnixMicro(),
+		Method:     e.method,
+		ReqParams:  e.reqParams,
+		StatusCode: e.statusCode,
+		RespHeader: fakeRespHeader,
+		Duration:   time.Since(e.startTime).Microseconds(),
+	}
+
+	b := e.j.logPool.Get().(*bytes.Buffer)
+	defer e.j.logPool.Put(b)
+	b.Reset()
+
+	e.j.filterLogging(auditLog, b, true)
+}
+
+var NoopLogCloser LogCloser = noopLogCloser{}
+
+type AuditHandler interface {
 	rpc2.Interceptor
 	rpc.ProgressHandler
-}, logFile LogCloser, err error,
-) {
+	StartAudit(ctx context.Context, method, reqParams string) (*AuditLogEntry, context.Context)
+}
+
+type noopAuditHandler struct{}
+
+var NoopAuditHandler AuditHandler = noopAuditHandler{}
+
+func (noopAuditHandler) Handler(w http.ResponseWriter, req *http.Request, f func(http.ResponseWriter, *http.Request)) {
+	f(w, req)
+}
+
+func (noopAuditHandler) Handle(w rpc2.ResponseWriter, req *rpc2.Request, f rpc2.Handle) error {
+	return f(w, req)
+}
+
+func (noopAuditHandler) StartAudit(ctx context.Context, method, reqParams string) (*AuditLogEntry, context.Context) {
+	return nil, ctx
+}
+
+func Open(module string, cfg *Config) (ph AuditHandler, logFile LogCloser, err error) {
 	if cfg.BodyLimit < 0 {
 		cfg.BodyLimit = 0
 	} else if cfg.BodyLimit == 0 {
@@ -170,6 +260,22 @@ func Open(module string, cfg *Config) (ph interface {
 		},
 		cfg: cfg,
 	}, logFile, nil
+}
+
+func (j *jsonAuditlog) StartAudit(ctx context.Context, method, reqParams string) (*AuditLogEntry, context.Context) {
+	span := trace.SpanFromContext(ctx)
+	if span == nil {
+		span, ctx = trace.StartSpanFromContext(ctx, method)
+	}
+
+	return &AuditLogEntry{
+		span:      span,
+		module:    j.module,
+		method:    method,
+		reqParams: reqParams,
+		startTime: time.Now(),
+		j:         j,
+	}, ctx
 }
 
 func (j *jsonAuditlog) Handler(w http.ResponseWriter, req *http.Request, f func(http.ResponseWriter, *http.Request)) {

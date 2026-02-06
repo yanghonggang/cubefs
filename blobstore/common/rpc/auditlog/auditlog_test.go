@@ -16,6 +16,7 @@ package auditlog
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 )
@@ -435,4 +437,78 @@ func Benchmark_ParserAuditlog(b *testing.B) {
 	for ii := 0; ii < b.N; ii++ {
 		sender.SendEntry(entry)
 	}
+}
+
+func TestAuditLogEntry_Basic(t *testing.T) {
+	moduleName := "func_test"
+	tmpDir := t.TempDir()
+
+	cfg := &Config{
+		LogDir:    tmpDir,
+		LogFormat: LogFormatJSON,
+		MetricConfig: PrometheusConfig{
+			Idc: moduleName,
+		},
+	}
+
+	oh, lc, err := Open(moduleName, cfg)
+	require.NoError(t, err)
+	defer lc.Close()
+
+	_, ok := oh.(*jsonAuditlog)
+	require.True(t, ok)
+
+	tracer := trace.NewTracer(moduleName)
+	trace.SetGlobalTracer(tracer)
+
+	var reqParams string
+	statusCode := 200
+	blobGet := func(ctx context.Context, offset, size int64) (err error) {
+		reqParams = fmt.Sprintf(`{"offset":%d,"size":%d}`, offset, size)
+		entry, ctx := oh.StartAudit(ctx, "BlobGet", reqParams)
+		defer func() {
+			entry.FinishAudit(errcode.DetectCode(err))
+		}()
+
+		time.Sleep(1 * time.Millisecond)
+		span := trace.SpanFromContext(ctx)
+		if span != nil {
+			span.AppendRPCTrackLog([]string{"ACCESS", "DISK_READ"})
+			span.SetTag("user", "test_user")
+		}
+		return nil
+	}
+
+	ctx := context.Background()
+	err = blobGet(ctx, 1024, 4096)
+	require.NoError(t, err)
+
+	logFile, err := os.Open(tmpDir)
+	require.NoError(t, err)
+	defer logFile.Close()
+	infos, err := logFile.Readdir(-1)
+	require.NoError(t, err)
+	require.Len(t, infos, 1)
+
+	content, err := os.ReadFile(tmpDir + "/" + infos[0].Name())
+	t.Logf("audit log content: %s\n", string(content))
+	require.NoError(t, err)
+
+	var audit AuditLog
+	err = json.Unmarshal(content, &audit)
+	require.NoError(t, err)
+
+	require.Equal(t, "REQ", audit.ReqType)
+	require.Equal(t, moduleName, audit.Module)
+	require.Equal(t, "BlobGet", audit.Method)
+	require.Equal(t, reqParams, audit.ReqParams)
+	require.Equal(t, statusCode, audit.StatusCode)
+	require.Greater(t, audit.Duration, int64(1000))
+
+	require.Contains(t, audit.RespHeader, rpc.HeaderTraceLog)
+	rawLogs := audit.RespHeader[rpc.HeaderTraceLog]
+	logsBytes, _ := json.Marshal(rawLogs)
+	require.Equal(t, `["ACCESS","DISK_READ"]`, string(logsBytes))
+
+	require.Contains(t, audit.RespHeader[rpc.HeaderTraceTags], "user:test_user")
 }
