@@ -32,6 +32,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 	"github.com/cubefs/cubefs/blobstore/util/largefile"
+	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
 const (
@@ -246,12 +247,12 @@ func Open(module string, cfg *Config) (ph OpHandler, logFile LogCloser, err erro
 		logFilter:    logFilter,
 
 		logPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return new(bytes.Buffer)
 			},
 		},
 		bodyPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return make([]byte, cfg.BodyLimit)
 			},
 		},
@@ -260,10 +261,6 @@ func Open(module string, cfg *Config) (ph OpHandler, logFile LogCloser, err erro
 }
 
 func (j *jsonAuditlog) Handler(w http.ResponseWriter, req *http.Request, f func(http.ResponseWriter, *http.Request)) {
-	var (
-		logBytes []byte
-		err      error
-	)
 	startTime := time.Now().UnixNano()
 
 	ctx := req.Context()
@@ -353,33 +350,11 @@ func (j *jsonAuditlog) Handler(w http.ResponseWriter, req *http.Request, f func(
 	auditLog.RespLength = _w.getBodyWritten()
 	auditLog.Duration = endTime - startTime/1000
 
-	if j.logFile == nil || j.logFilter.Filter(auditLog) {
-		if !j.cfg.MetricsFilter {
-			j.metricSender.Send(auditLog.ToBytesWithTab(b))
-		}
-		return
-	}
-
-	j.metricSender.Send(auditLog.ToBytesWithTab(b))
-
-	switch j.cfg.LogFormat {
-	case LogFormatJSON:
-		logBytes = auditLog.ToJson()
-	default:
-		logBytes = b.Bytes() // *bytes.Buffer was filled with metricSender.Send
-	}
-	err = j.logFile.Log(logBytes)
-	if err != nil {
-		span.Errorf("jsonlog.Handler Log failed, err: %s", err.Error())
-		return
-	}
+	j.filterLogging(auditLog, b, false)
 }
 
 func (j *jsonAuditlog) Handle(w rpc2.ResponseWriter, req *rpc2.Request, f rpc2.Handle) error {
-	var (
-		logBytes []byte
-		err      error
-	)
+	var err error
 	startTime := time.Now().UnixNano()
 
 	span := req.Span()
@@ -444,7 +419,7 @@ func (j *jsonAuditlog) Handle(w rpc2.ResponseWriter, req *rpc2.Request, f rpc2.H
 	}
 	if _w.spanTags < newTagsN {
 		tags := make([]string, 0, newTagsN)
-		span.TagsRange(func(key string, val interface{}) bool {
+		span.TagsRange(func(key string, val any) bool {
 			tags = append(tags, key+":"+fmt.Sprint(val))
 			return true
 		})
@@ -459,25 +434,42 @@ func (j *jsonAuditlog) Handle(w rpc2.ResponseWriter, req *rpc2.Request, f rpc2.H
 
 	auditLog.Duration = endTime - startTime/1000
 
+	j.filterLogging(auditLog, b, true)
+	return err
+}
+
+func (j *jsonAuditlog) filterLogging(auditLog *AuditLog, b *bytes.Buffer, entry bool) {
 	if j.logFile == nil || j.logFilter.Filter(auditLog) {
 		if !j.cfg.MetricsFilter {
-			j.metricSender.Send(auditLog.ToBytesWithTab(b))
+			if entry {
+				j.metricSender.SendEntry(&auditLogEntry{log: auditLog})
+			} else {
+				j.metricSender.Send(auditLog.ToBytesWithTab(b))
+			}
 		}
-		return err
+		return
 	}
 
-	j.metricSender.SendEntry(&auditLogEntry{log: auditLog})
+	if entry {
+		j.metricSender.SendEntry(&auditLogEntry{log: auditLog})
+	} else {
+		j.metricSender.Send(auditLog.ToBytesWithTab(b))
+	}
 
+	var logBytes []byte
 	switch j.cfg.LogFormat {
 	case LogFormatJSON:
 		logBytes = auditLog.ToJson()
 	default:
-		logBytes = auditLog.ToBytesWithTab(b)
+		if entry {
+			logBytes = auditLog.ToBytesWithTab(b)
+		} else {
+			logBytes = b.Bytes() // *bytes.Buffer was filled with metricSender.Send
+		}
 	}
-	if errLog := j.logFile.Log(logBytes); errLog != nil {
-		span.Errorf("jsonlog.Handle logging failed, err: %s", errLog.Error())
+	if err := j.logFile.Log(logBytes); err != nil {
+		log.Errorf("audit logging failed, error: %s", err.Error())
 	}
-	return err
 }
 
 func (j *jsonAuditlog) StartAudit(ctx context.Context, module, method, reqParams string) (*AuditLogEntry, context.Context) {
